@@ -1,4 +1,3 @@
-# sa_head.py
 import os
 import json
 import pickle
