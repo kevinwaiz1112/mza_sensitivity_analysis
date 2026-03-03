@@ -1,11 +1,16 @@
-# sa_sim_runner.py
-import os, json, time, uuid, shutil, pathlib, re
-import numpy as np
+import os
+import json
+import time
+import uuid
+import shutil
+import pathlib
+import re
 import csv
 import multiprocessing
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Tuple
 
+import numpy as np
 from ebcpy import DymolaAPI, TimeSeriesData
 
 # >>> utils import
@@ -25,13 +30,13 @@ OUTPUT_INTERVAL_SEC = 60 * 60
 # ───────────────────────────────────────────────────────────────
 @dataclass
 class SAParams:
-    # Setpoints (werden jetzt über zone_control/payload gesteuert; bleiben fürs Interface)
+    # Setpoints (controlled via zone_control/payload; kept for interface compatibility)
     tset_mean_K: float = 293.15
     tset_spread_K: float = 1.0
 
     gains_scale: float = 1.0
 
-    # optional (aktuell nicht genutzt für LPG-Zuordnung, aber bleibt)
+    # optional (currently not used for LPG mapping but kept)
     zone_weights: Optional[List[float]] = None
 
     rng_seed: int = 1234
@@ -50,7 +55,7 @@ class SAParams:
 
 
 # ───────────────────────────────────────────────────────────────
-# Helpers
+# Helpers: records + zones
 # ───────────────────────────────────────────────────────────────
 def _read_lines(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -59,8 +64,8 @@ def _read_lines(path: str) -> List[str]:
 
 def find_zone_record_files(sim_models_dir: str, formatted_id: str) -> list[tuple[int, str]]:
     """
-    Liefert Liste [(zone_number_in_filename, filepath), ...] sortiert nach zone_number_in_filename.
-    Erwartet Dateien wie: <formatted_id>_Storey_1_Zone_2.mo
+    Returns list [(zone_number_in_filename, filepath), ...] sorted by zone_number_in_filename.
+    Expects files like: <formatted_id>_Storey_1_Zone_2.mo
     """
     record_dir = os.path.join(sim_models_dir, formatted_id, f"{formatted_id}_DataBase")
     if not os.path.isdir(record_dir):
@@ -80,13 +85,52 @@ def find_zone_record_files(sim_models_dir: str, formatted_id: str) -> list[tuple
     out.sort(key=lambda t: t[0])
     return out
 
+
+def _infer_n_zones_from_any_record(sim_models_dir: str, formatted_id: str) -> int:
+    """
+    Robustly infer n_zones by reading nNZs from any Zone_*.mo record.
+    Fallback: len(zfiles) or 1.
+    """
+    zfiles = find_zone_record_files(sim_models_dir, formatted_id)
+    if not zfiles:
+        return 1
+
+    _, fp = zfiles[0]
+    lines = _read_lines(fp)
+
+    for line in lines:
+        s = line.strip()
+        if s.startswith("nNZs"):
+            try:
+                return max(1, int(s.split("=")[1].strip().rstrip(",").rstrip(");")))
+            except Exception:
+                pass
+    return max(1, len(zfiles))
+
+
+def _zone_name_from_record_filename(formatted_id: str, record_fp: str) -> str:
+    """
+    Extracts zone name from record filename:
+      <formatted_id>_<ZONE-NAME>.mo  -> returns <ZONE-NAME>
+    """
+    fn = os.path.basename(record_fp)
+    if fn.lower().endswith(".mo"):
+        fn = fn[:-3]
+    prefix = f"{formatted_id}_"
+    if fn.startswith(prefix):
+        return fn[len(prefix):]
+    return fn
+
+
+# ───────────────────────────────────────────────────────────────
+# Outputs: build list of Dymola variables to export
+# ───────────────────────────────────────────────────────────────
 def build_selected_parameters(n_zones: int) -> List[Tuple[str, str]]:
     """
-    Baut die Liste (dymola_var, csv_column_name) abhängig von n_zones.
-    - Wetter immer
-    - Zonale Größen als Vektoren [1..n_zones]
+    Returns list of (dymola_var, csv_column) depending on n_zones.
+    Includes weather bus + zonal vectors [1..n_zones].
     """
-    base = [
+    base: List[Tuple[str, str]] = [
         ("weaDat.weaBus.TDryBul", "temp_air"),
         ("weaDat.weaBus.TDewPoi", "temp_dew"),
         ("weaDat.weaBus.relHum",  "relHum"),
@@ -97,7 +141,6 @@ def build_selected_parameters(n_zones: int) -> List[Tuple[str, str]]:
         ("weaDat.weaBus.pAtm",    "pressure"),
     ]
 
-    # Zonale Größen
     for z in range(1, int(n_zones) + 1):
         base.append((f"multizone.TSetHeat[{z}]", f"TSetHeat_{z}"))
         base.append((f"multizone.TSetCool[{z}]", f"TSetCool_{z}"))
@@ -105,25 +148,27 @@ def build_selected_parameters(n_zones: int) -> List[Tuple[str, str]]:
         base.append((f"multizone.TRad[{z}]",     f"TRad_{z}"))
         base.append((f"multizone.PHeater[{z}]",  f"HeatDemand_{z}"))
         base.append((f"multizone.PCooler[{z}]",  f"CoolDemand_{z}"))
-
-        # Internal gains (falls vorhanden)
         base.append((f"multizone.QIntGains_flow[{z},1]", f"GainsLights_{z}"))
         base.append((f"multizone.QIntGains_flow[{z},2]", f"GainsMachines_{z}"))
         base.append((f"multizone.QIntGains_flow[{z},3]", f"GainsHumans_{z}"))
 
-    # optional: Integrator (falls im Modell vorhanden)
+    # optional (only if model contains these variables)
     base.append(("integrator.y", "HeatDemand_SUM"))
     base.append(("integrator.u", "HeatDemand"))
-
-    # optional: Input-Table Outputs (falls vorhanden)
     base.append(("tableInternalGains.y[1]", "occupancy_abs"))
     base.append(("tableInternalGains.y[4]", "occupancy_rel"))
 
     return base
 
+
+# ───────────────────────────────────────────────────────────────
+# Record patching: WWR scaling
+# ───────────────────────────────────────────────────────────────
 def _scale_array_assignment_in_mo(content: str, key: str, factor: float) -> str:
     """
-    Skaliert z.B. AWin = {1,2,3} -> AWin = {f*1,f*2,f*3}
+    Scales array assignments like:
+        AWin = {1,2,3}
+    ->  AWin = {factor*1, factor*2, factor*3}
     """
     pattern = re.compile(rf"(\b{re.escape(key)}\b\s*=\s*)\{{([^}}]+)\}}", re.MULTILINE)
 
@@ -131,13 +176,12 @@ def _scale_array_assignment_in_mo(content: str, key: str, factor: float) -> str:
         prefix = m.group(1)
         inner = m.group(2).strip()
         parts = [p.strip() for p in inner.split(",") if p.strip()]
-        vals = []
+        vals: List[float] = []
         for p in parts:
-            # toleriert floats/ints in Modelica-Format
             try:
                 vals.append(float(p))
             except Exception:
-                # wenn parsing scheitert, unverändert lassen
+                # if parsing fails, keep original text
                 return m.group(0)
         scaled = [v * float(factor) for v in vals]
         inner_scaled = ", ".join(f"{v:.15g}" for v in scaled)
@@ -148,8 +192,8 @@ def _scale_array_assignment_in_mo(content: str, key: str, factor: float) -> str:
 
 def apply_wwr_factor_to_zone_records(sim_models_dir: str, formatted_id: str, wwr_factor: float) -> int:
     """
-    Skaliert AWin und ATransparent in allen Zone-Records.
-    Rückgabe: Anzahl gepatchter Dateien.
+    Scales AWin and ATransparent in all zone records.
+    Returns number of patched files.
     """
     zfiles = find_zone_record_files(sim_models_dir, formatted_id)
     if not zfiles:
@@ -171,127 +215,16 @@ def apply_wwr_factor_to_zone_records(sim_models_dir: str, formatted_id: str, wwr
 
     return patched
 
-def _tsd_time_vector(tsd: TimeSeriesData) -> np.ndarray:
-    """
-    Robust: findet Zeitachse.
-    """
-    # ebcpy TimeSeriesData hat meist .time oder index in to_df()
-    if hasattr(tsd, "time"):
-        t = np.asarray(getattr(tsd, "time"))
-        if t.size > 0:
-            return t
-    # fallback über irgendeine Variable
-    try:
-        any_key = next(iter(tsd.keys()))
-        t = np.asarray(tsd[any_key].index)
-        return t
-    except Exception:
-        pass
-    # letzter fallback: leer
-    return np.array([], dtype=float)
 
-
-def write_timeseries_csv(
-    tsd: TimeSeriesData,
-    selected: List[Tuple[str, str]],
-    out_csv_path: str,
-) -> Dict[str, Any]:
-    """
-    Schreibt CSV: time + alle selected Signale.
-    Fehlende Signale => Spalte mit NaN.
-    Gibt Meta zurück (missing list, n_rows, columns).
-    """
-    time_vec = _tsd_time_vector(tsd)
-    # wenn time nicht gefunden: über ein vorhandenes Signal
-    if time_vec.size == 0:
-        # versuche über erste existierende Variable
-        for var, _ in selected:
-            try:
-                s = tsd[var]
-                time_vec = np.asarray(getattr(s, "index", np.arange(len(s.values))))
-                break
-            except Exception:
-                continue
-
-    n = int(time_vec.size)
-    cols = ["time_s"] + [col for _, col in selected]
-
-    data = {}
-    missing = []
-    for var, col in selected:
-        try:
-            s = tsd[var]
-            v = np.asarray(s.values).flatten()
-            if v.size != n:
-                # trim/pad
-                if v.size > n:
-                    v = v[:n]
-                else:
-                    vv = np.full(n, np.nan, dtype=float)
-                    vv[:v.size] = v
-                    v = vv
-            data[col] = v
-        except Exception:
-            data[col] = np.full(n, np.nan, dtype=float)
-            missing.append(var)
-
-    os.makedirs(os.path.dirname(out_csv_path), exist_ok=True)
-
-    with open(out_csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(cols)
-        for i in range(n):
-            row = [float(time_vec[i])]
-            for _, col in selected:
-                val = data[col][i]
-                row.append("" if (val is None or (isinstance(val, float) and np.isnan(val))) else float(val))
-            w.writerow(row)
-
-    return {
-        "csv_path": out_csv_path,
-        "n_rows": n,
-        "columns": cols,
-        "missing_variables": missing,
-    }
-
-def _infer_n_zones_from_any_record(sim_models_dir: str, formatted_id: str) -> int:
-    """
-    Robust: Nimmt irgendeinen Zone_*.mo Record und liest nNZs.
-    Fallback: len(zfiles) oder 1
-    """
-    zfiles = find_zone_record_files(sim_models_dir, formatted_id)
-    if not zfiles:
-        return 1
-
-    _, fp = zfiles[0]
-    lines = _read_lines(fp)
-
-    for line in lines:
-        s = line.strip()
-        if s.startswith("nNZs"):
-            try:
-                return max(1, int(s.split("=")[1].strip().rstrip(",").rstrip(");")))
-            except Exception:
-                pass
-    return max(1, len(zfiles))
-
-
-def _zone_name_from_record_filename(formatted_id: str, record_fp: str) -> str:
-    """
-    Extrahiert den Zonennamen aus dem Record-Filename:
-      <formatted_id>_<ZONE-NAME>.mo  -> gibt <ZONE-NAME> zurück
-    """
-    fn = os.path.basename(record_fp)
-    # strip prefix and suffix
-    if fn.lower().endswith(".mo"):
-        fn = fn[:-3]
-    prefix = f"{formatted_id}_"
-    if fn.startswith(prefix):
-        return fn[len(prefix):]
-    return fn
-
-
+# ───────────────────────────────────────────────────────────────
+# Record patching: generic key=value overrides
+# ───────────────────────────────────────────────────────────────
 def apply_record_overrides_regex(record_file_path: str, overrides: Dict[str, Any]) -> None:
+    """
+    Replaces assignments in record files:
+        key = <value>
+    Keeps formatting fairly stable; only replaces the RHS value.
+    """
     if not overrides:
         return
 
@@ -332,6 +265,10 @@ def build_effective_zone_overrides(
     global_overrides: Dict[str, Any],
     by_zone: Optional[List[Dict[str, Any]]],
 ) -> List[Dict[str, Any]]:
+    """
+    Override precedence per zone:
+      defaults(lpg flags) -> global_overrides -> by_zone[zi]
+    """
     if n_zones <= 0:
         return []
 
@@ -349,6 +286,11 @@ def build_effective_zone_overrides(
 
 
 def apply_zone_record_overrides(sim_models_dir: str, formatted_id: str, sa_params: SAParams) -> int:
+    """
+    Patches all Zone_*.mo records with overrides.
+    Zone order matches sorted Zone_* file list.
+    Returns number of zone records found (and processed).
+    """
     zfiles = find_zone_record_files(sim_models_dir, formatted_id)
     if not zfiles:
         return 0
@@ -368,7 +310,7 @@ def apply_zone_record_overrides(sim_models_dir: str, formatted_id: str, sa_param
 
 
 # ───────────────────────────────────────────────────────────────
-# Setpoints: jetzt "explicit" möglich (konstant über das Jahr)
+# Setpoints tables (constant over 8760h)
 # ───────────────────────────────────────────────────────────────
 def write_setpoints_multizone(
     time_table_T_set: str,
@@ -380,34 +322,32 @@ def write_setpoints_multizone(
     cool_vals_K: Optional[np.ndarray] = None,
 ):
     """
-    Schreibt konstante Setpoints (8760h).
-    Wenn heat_vals_K/cool_vals_K übergeben werden: diese werden verwendet.
+    Writes constant setpoints (8760h) as Dymola text tables.
+    If heat_vals_K/cool_vals_K are provided: uses them.
     """
     if n_zones <= 0:
-        raise ValueError("n_zones muss >= 1 sein")
+        raise ValueError("n_zones must be >= 1")
 
     if heat_vals_K is None:
-        # Fallback: 20°C überall (TH=8°C falls n_zones>1)
         heat_vals_K = np.full(n_zones, 293.15, dtype=float)
         if n_zones > 1:
-            heat_vals_K[0] = 281.15
+            heat_vals_K[0] = 281.15  # TH frost protection
 
     if cool_vals_K is None:
-        # Fallback: Cooling "aus" via 60°C
-        cool_vals_K = np.full(n_zones, 273.15 + 60.0, dtype=float)
+        cool_vals_K = np.full(n_zones, 273.15 + 60.0, dtype=float)  # cooling off
 
     heat_vals_K = np.asarray(heat_vals_K, dtype=float).flatten()
     cool_vals_K = np.asarray(cool_vals_K, dtype=float).flatten()
 
     if heat_vals_K.size != n_zones:
-        raise ValueError(f"heat_vals_K muss Länge {n_zones} haben, hat {heat_vals_K.size}")
+        raise ValueError(f"heat_vals_K must have length {n_zones}, got {heat_vals_K.size}")
     if cool_vals_K.size != n_zones:
-        raise ValueError(f"cool_vals_K muss Länge {n_zones} haben, hat {cool_vals_K.size}")
+        raise ValueError(f"cool_vals_K must have length {n_zones}, got {cool_vals_K.size}")
 
     if not enable_cooling:
         cool_vals_K[:] = 273.15 + 60.0
 
-    def _write(path, table_name, vals):
+    def _write(path: str, table_name: str, vals: np.ndarray):
         with open(path, "w", encoding="utf-8") as f:
             f.write(f"#1\ndouble {table_name}({full_year_hours}, {1+n_zones})\n")
             for h in range(full_year_hours):
@@ -421,8 +361,8 @@ def write_setpoints_multizone(
 
 def _resolve_zone_control_value(zone_name: str, zone_control: Optional[dict]) -> dict:
     """
-    identisch zur Logik im TEASER-Script (vereinfachtes Mirror),
-    damit wir aus zone_control Arrays für die Setpoint-Tabellen bauen können.
+    Mirror of TEASER-side zone_control resolution (simplified):
+    - exact match in zone_control["zones"] else zone_control["default"]
     """
     if not zone_control:
         return {"heated": True, "heat_setpoint_K": 294.15, "cooled": False, "cool_setpoint_K": 0.0}
@@ -439,14 +379,17 @@ def _resolve_zone_control_value(zone_name: str, zone_control: Optional[dict]) ->
     heat_sp_K = float(zc.get("heat_setpoint_K", 294.15))
     cool_sp_K = float(zc.get("cool_setpoint_K", 299.15))
 
-    # wenn nicht heated -> Setpoint auf 0 setzen ist in TEASER so, hier machen wir Frostschutz nicht automatisch
     return {"heated": heated, "heat_setpoint_K": heat_sp_K, "cooled": cooled, "cool_setpoint_K": cool_sp_K}
 
 
-def _setpoints_from_zone_control(sim_models_dir: str, formatted_id: str, zone_control: Optional[dict]) -> Tuple[np.ndarray, np.ndarray]:
+def _setpoints_from_zone_control(
+    sim_models_dir: str,
+    formatted_id: str,
+    zone_control: Optional[dict],
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Baut (heat_vals_K, cool_vals_K) in der Reihenfolge der Zone-Records.
-    Matching über Record-Dateiname -> zone_name.
+    Builds (heat_vals_K, cool_vals_K) in the order of zone record files.
+    Matches by record filename -> zone_name.
     """
     zfiles = find_zone_record_files(sim_models_dir, formatted_id)
     if not zfiles:
@@ -459,17 +402,13 @@ def _setpoints_from_zone_control(sim_models_dir: str, formatted_id: str, zone_co
         zname = _zone_name_from_record_filename(formatted_id, fp)
         zc = _resolve_zone_control_value(zname, zone_control)
         heat[i] = float(zc["heat_setpoint_K"]) if zc.get("heated", True) else 0.0
-        # Cooling "aus" => 60°C
-        if zc.get("cooled", False):
-            cool[i] = float(zc.get("cool_setpoint_K", 299.15))
-        else:
-            cool[i] = 273.15 + 60.0
+        cool[i] = float(zc.get("cool_setpoint_K", 299.15)) if zc.get("cooled", False) else (273.15 + 60.0)
 
     return heat, cool
 
 
 # ───────────────────────────────────────────────────────────────
-# TEASER build/export (neu)
+# TEASER build/export
 # ───────────────────────────────────────────────────────────────
 def ensure_teaser_model(
     sim_models_dir: str,
@@ -479,13 +418,17 @@ def ensure_teaser_model(
     zone_control: Optional[dict],
     force_rebuild: bool = False,
 ) -> None:
+    """
+    Builds/overwrites the TEASER/AixLib export model for this formatted_id in sim_models_dir.
+    - uses YoC via building_payload["building_data"]["sa_tabula_year_class"]
+    - uses zone_control (sa_zone_control) for zonal HVAC setpoints
+    """
     if (not force_rebuild) and building_model_exists(formatted_id, sim_models_dir):
         return
 
     bdir = os.path.join(sim_models_dir, formatted_id)
     if os.path.isdir(bdir):
         shutil.rmtree(bdir, ignore_errors=True)
-
     os.makedirs(sim_models_dir, exist_ok=True)
 
     from teaser.project import Project
@@ -497,7 +440,7 @@ def ensure_teaser_model(
     if zone_control is None:
         zone_control = (building_payload.get("building_data", {}) or {}).get("sa_zone_control")
 
-    # >>> WICHTIG: export folder/name stabilisieren
+    # stabilize export folder/name: TEASER uses building_info["building_id"]
     payload_for_export = dict(building_payload)
     payload_for_export["building_id"] = str(formatted_id)
 
@@ -518,21 +461,19 @@ def ensure_teaser_model(
         prj.export_aixlib(sim_models_dir)
 
     if not building_model_exists(formatted_id, sim_models_dir):
-        raise RuntimeError(
-            f"TEASER export scheint fehlgeschlagen: {formatted_id} nicht in {sim_models_dir} gefunden."
-        )
+        raise RuntimeError(f"TEASER export failed: {formatted_id} not found in {sim_models_dir}")
 
 
 # ───────────────────────────────────────────────────────────────
-# Internal gains tables (wie gehabt)
+# Internal gains table (multizone) writing
 # ───────────────────────────────────────────────────────────────
 def write_internal_gains_multizone_table_from_zone_series(
     combi_time_table_path: str,
     full_year_hours: int,
-    people_z: np.ndarray,     # shape (n_zones, 8760)
-    machines_z: np.ndarray,   # shape (n_zones, 8760)
-    lights_z: np.ndarray,     # shape (n_zones, 8760)
-    occ_rel_z: np.ndarray,    # shape (n_zones, 8760)
+    people_z: np.ndarray,     # (n_zones, 8760)
+    machines_z: np.ndarray,   # (n_zones, 8760)
+    lights_z: np.ndarray,     # (n_zones, 8760)
+    occ_rel_z: np.ndarray,    # (n_zones, 8760)
 ):
     n_zones = int(people_z.shape[0])
     n_cols = 1 + 4 * n_zones
@@ -553,6 +494,83 @@ def write_internal_gains_multizone_table_from_zone_series(
 
 
 # ───────────────────────────────────────────────────────────────
+# Timeseries CSV export from TimeSeriesData
+# ───────────────────────────────────────────────────────────────
+def _tsd_time_vector(tsd: TimeSeriesData) -> np.ndarray:
+    """
+    Robust extraction of a time axis.
+    """
+    if hasattr(tsd, "time"):
+        t = np.asarray(getattr(tsd, "time"))
+        if t.size > 0:
+            return t
+
+    try:
+        any_key = next(iter(tsd.keys()))
+        t = np.asarray(tsd[any_key].index)
+        return t
+    except Exception:
+        return np.array([], dtype=float)
+
+
+def write_timeseries_csv(
+    tsd: TimeSeriesData,
+    selected: List[Tuple[str, str]],
+    out_csv_path: str,
+) -> Dict[str, Any]:
+    """
+    Writes CSV: time + all selected signals.
+    Missing signals => NaN column.
+    Returns metadata.
+    """
+    time_vec = _tsd_time_vector(tsd)
+
+    if time_vec.size == 0:
+        for var, _ in selected:
+            try:
+                s = tsd[var]
+                time_vec = np.asarray(getattr(s, "index", np.arange(len(s.values))))
+                break
+            except Exception:
+                continue
+
+    n = int(time_vec.size)
+    cols = ["time_s"] + [col for _, col in selected]
+
+    data: Dict[str, np.ndarray] = {}
+    missing: List[str] = []
+
+    for var, col in selected:
+        try:
+            s = tsd[var]
+            v = np.asarray(s.values).flatten()
+            if v.size != n:
+                if v.size > n:
+                    v = v[:n]
+                else:
+                    vv = np.full(n, np.nan, dtype=float)
+                    vv[:v.size] = v
+                    v = vv
+            data[col] = v
+        except Exception:
+            data[col] = np.full(n, np.nan, dtype=float)
+            missing.append(var)
+
+    os.makedirs(os.path.dirname(out_csv_path), exist_ok=True)
+    with open(out_csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for i in range(n):
+            row = [float(time_vec[i])]
+            for _, col in selected:
+                val = data[col][i]
+                row.append("" if (val is None or (isinstance(val, float) and np.isnan(val))) else float(val))
+            w.writerow(row)
+
+    return {"csv_path": out_csv_path, "n_rows": n, "columns": cols, "missing_variables": missing}
+
+
+# ───────────────────────────────────────────────────────────────
 # Single run
 # ───────────────────────────────────────────────────────────────
 def simulate_one(
@@ -565,10 +583,10 @@ def simulate_one(
     year: int,
     start_sim: int,
     end_sim: int,
-    lpg_results_path: str,  # bleibt im Interface
+    lpg_results_path: str,  # kept in interface
     sa_params: SAParams,
     internal_gains_mode: str = "multizone_table",
-    # ── NEU (aus Head)
+    # from head
     building_payload: Optional[Dict[str, Any]] = None,
     zone_control: Optional[dict] = None,
     task_meta: Optional[Dict[str, Any]] = None,
@@ -581,7 +599,7 @@ def simulate_one(
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 0) TEASER model build (nur wenn payload vorhanden)
+    # 0) TEASER model build (new per run by default)
     if building_payload is not None:
         ensure_teaser_model(
             sim_models_dir=sim_models_dir,
@@ -592,43 +610,35 @@ def simulate_one(
             force_rebuild=bool(force_teaser_rebuild),
         )
 
-    # ab hier muss Modell existieren
     if not building_model_exists(formatted_id, sim_models_dir):
-        raise FileNotFoundError(f"Kein Sim-Modell für {formatted_id} in {sim_models_dir}")
+        raise FileNotFoundError(f"No sim model for {formatted_id} in {sim_models_dir}")
 
     run_id = f"{int(time.time()*1000)}_{os.getpid()}_{uuid.uuid4().hex[:6]}"
     work_dir = out_dir / "work" / run_id
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # Weather vorbereiten (Side-effect: Referenzen updaten)
+    # Weather prepare (side-effects: updates record references etc.)
     parse_weather_and_update_reference(
         mos_file_path=mos_file_path,
         sim_models_dir=sim_models_dir,
         formatted_id=formatted_id,
     )
 
-    # Pfade für Input-Tabellen
     combi_time_table_path = os.path.join(sim_models_dir, formatted_id, f"InternalGains_{formatted_id}.txt")
     time_table_T_set      = os.path.join(sim_models_dir, formatted_id, f"TsetHeat_{formatted_id}.txt")
     time_table_T_set_cool = os.path.join(sim_models_dir, formatted_id, f"TsetCool_{formatted_id}.txt")
 
     full_year_hours = 8760
-
-    # n_zones robust bestimmen über Zone_*.mo records
     n_zones = _infer_n_zones_from_any_record(sim_models_dir, formatted_id)
 
-    # ────────────────────────────────────────────────────────────
-    # LPG: Profile ziehen
-    # ────────────────────────────────────────────────────────────
+    # 1) LPG profile generation
     if sa_params.lpg_cfg is None:
-        raise ValueError("sa_params.lpg_cfg ist None – LPGSelectionConfig muss gesetzt sein.")
+        raise ValueError("sa_params.lpg_cfg is None (LPGSelectionConfig required).")
 
     apt = build_lpg_apartments_year(seed=int(sa_params.rng_seed), cfg=sa_params.lpg_cfg)
-
-    occ_ap = apt["occupancy_abs"]   # (A, 8760)
-    mach_ap = apt["machines"]       # (A, 8760)
-    occ_rel_ap = apt["occupancy_rel"]  # (A, 8760)
-
+    occ_ap = apt["occupancy_abs"]     # (A, 8760)
+    mach_ap = apt["machines"]         # (A, 8760)
+    occ_rel_ap = apt["occupancy_rel"] # (A, 8760)
     A = int(occ_ap.shape[0])
 
     lighting_profile = np.asarray(
@@ -636,23 +646,35 @@ def simulate_one(
         dtype=float
     )[:full_year_hours]
 
-    # TH Zeitreihe (wie bisher)
+    # TH series
     th_people = np.full(full_year_hours, float(sa_params.th_people_factor))
     th_lights = float(sa_params.th_lights_factor) * lighting_profile
     th_machines = float(sa_params.th_machines_factor) * np.sum(mach_ap, axis=0)
     th_occ_rel = float(sa_params.th_occ_rel_factor) * np.clip(np.sum(occ_rel_ap, axis=0) / max(A, 1), 0, 1)
 
-    # Mapping Apartments -> Zones (Best-effort)
+    # Apartment -> Zone mapping (best effort)
     if n_zones == 1:
         people_z = np.sum(occ_ap, axis=0, keepdims=True)
         machines_z = np.sum(mach_ap, axis=0, keepdims=True) * float(sa_params.gains_scale)
         lights_z = lighting_profile[None, :]
         occ_rel_z = np.clip(np.mean(occ_rel_ap, axis=0, keepdims=True), 0, 1)
     elif n_zones == 2:
-        people_z = np.vstack([th_people[None, :], np.sum(occ_ap, axis=0, keepdims=True) * (1.0 - float(sa_params.th_people_factor))])
-        machines_z = np.vstack([th_machines[None, :], np.sum(mach_ap, axis=0, keepdims=True) * float(sa_params.gains_scale)])
-        lights_z = np.vstack([th_lights[None, :], lighting_profile[None, :] * (1.0 - float(sa_params.th_lights_factor))])
-        occ_rel_z = np.vstack([th_occ_rel[None, :], np.clip(np.mean(occ_rel_ap, axis=0, keepdims=True), 0, 1)])
+        people_z = np.vstack([
+            th_people[None, :],
+            np.sum(occ_ap, axis=0, keepdims=True) * (1.0 - float(sa_params.th_people_factor)),
+        ])
+        machines_z = np.vstack([
+            th_machines[None, :],
+            np.sum(mach_ap, axis=0, keepdims=True) * float(sa_params.gains_scale),
+        ])
+        lights_z = np.vstack([
+            th_lights[None, :],
+            lighting_profile[None, :] * (1.0 - float(sa_params.th_lights_factor)),
+        ])
+        occ_rel_z = np.vstack([
+            th_occ_rel[None, :],
+            np.clip(np.mean(occ_rel_ap, axis=0, keepdims=True), 0, 1),
+        ])
     else:
         n_res = n_zones - 1
         idx = np.arange(n_res) % max(A, 1)
@@ -675,10 +697,7 @@ def simulate_one(
         occ_rel_z=occ_rel_z,
     )
 
-    # ────────────────────────────────────────────────────────────
-    # 1) Setpoints: aus zone_control ableiten (konstant)
-    # ────────────────────────────────────────────────────────────
-    # bevorzugt: explizit übergeben, sonst payload
+    # 2) Setpoints from zone_control
     if zone_control is None and building_payload is not None:
         zone_control = (building_payload.get("building_data", {}) or {}).get("sa_zone_control")
 
@@ -694,20 +713,21 @@ def simulate_one(
         cool_vals_K=cool_vals_K,
     )
 
+    # 3) WWR patching via record_overrides_global["wwr_factor"]
     wwr_factor = float(sa_params.record_overrides_global.get("wwr_factor", 1.0))
     wwr_patched_files = apply_wwr_factor_to_zone_records(sim_models_dir, formatted_id, wwr_factor)
 
-    # 2) Record overrides je Zone anwenden
+    # 4) Generic record overrides (also writes default LPG flags per zone)
     patched = apply_zone_record_overrides(sim_models_dir, formatted_id, sa_params)
 
-    # nach ensure_teaser_model(...) in simulate_one:
+    # Copy model export for later inspection (per run)
     model_src = os.path.join(sim_models_dir, formatted_id)
     model_dst = os.path.join(str(out_dir), "model_export")
     if os.path.isdir(model_dst):
         shutil.rmtree(model_dst, ignore_errors=True)
     shutil.copytree(model_src, model_dst)
 
-    # 3) Dymola Run
+    # 5) Dymola simulation
     teaser_mo = os.path.join(sim_models_dir, "package.mo")
     model_name = f"{sim_model_pkg_name}.{formatted_id}.{formatted_id}"
 
@@ -715,39 +735,38 @@ def simulate_one(
         working_directory=str(work_dir),
         model_name=model_name,
         n_cpu=1,
-        packages=[aixlib_mo, teaser_mo],
+        packages=[str(aixlib_mo), str(teaser_mo)],
         show_window=False,
-        equidistant_output=False
+        equidistant_output=False,
     )
     dym_api.set_sim_setup({
         "start_time": int(start_sim),
         "stop_time": int(end_sim),
-        "output_interval": int(OUTPUT_INTERVAL_SEC)
+        "output_interval": int(OUTPUT_INTERVAL_SEC),
     })
 
     result_path = dym_api.simulate(return_option="savepath")
     tsd = TimeSeriesData(result_path)
 
-    # ── Zeitreihen-CSV (zonendynamisch)
-    # Totals (sum across zones)
+    # Sum loads across zones
     heat_sum_W = np.zeros_like(tsd["multizone.PHeater[1]"].values.flatten(), dtype=float)
     cool_sum_W = np.zeros_like(tsd["multizone.PCooler[1]"].values.flatten(), dtype=float)
-
     for z in range(1, n_zones + 1):
         heat_sum_W += tsd[f"multizone.PHeater[{z}]"].values.flatten()
         cool_sum_W += tsd[f"multizone.PCooler[{z}]"].values.flatten()
 
-    # Save zone map
+    # Save zone map (record filenames => zone labels)
     zfiles = find_zone_record_files(sim_models_dir, formatted_id)
     zone_labels = [_zone_name_from_record_filename(formatted_id, fp) for _, fp in zfiles]
     with open(out_dir / "zone_map.json", "w", encoding="utf-8") as f:
         json.dump({"n_zones": int(n_zones), "zones": zone_labels}, f, indent=2, ensure_ascii=False)
 
-    # Timeseries CSV
+    # Save timeseries
     selected = build_selected_parameters(n_zones=n_zones)
     ts_csv_path = str(out_dir / "timeseries.csv")
     ts_meta = write_timeseries_csv(tsd, selected, ts_csv_path)
 
+    # Aggregated KPIs
     heat_kWh = float(np.trapz(heat_sum_W, dx=OUTPUT_INTERVAL_SEC) / 3.6e6)
     cool_kWh = float(np.trapz(cool_sum_W, dx=OUTPUT_INTERVAL_SEC) / 3.6e6)
     peak_heat_kW = float(np.max(heat_sum_W) / 1000.0)
@@ -757,11 +776,16 @@ def simulate_one(
         "building_id": str(json_id),
         "formatted_id": str(formatted_id),
         "n_zones": int(n_zones),
+
         "patched_zone_records": int(patched),
+        "wwr_factor": float(wwr_factor),
+        "wwr_patched_files": int(wwr_patched_files),
+
         "heat_demand_kWh": heat_kWh,
         "cool_demand_kWh": cool_kWh,
         "peak_heat_kW": peak_heat_kW,
         "peak_cool_kW": peak_cool_kW,
+
         "lpg_cfg": {
             "n_apartments": int(sa_params.lpg_cfg.n_apartments),
             "tp_mode": str(sa_params.lpg_cfg.tp_mode),
@@ -770,44 +794,46 @@ def simulate_one(
             "r_values": list(sa_params.lpg_cfg.r_values),
         },
         "sa_params": {
-            "gains_scale": sa_params.gains_scale,
-            "rng_seed": sa_params.rng_seed,
+            "gains_scale": float(sa_params.gains_scale),
+            "rng_seed": int(sa_params.rng_seed),
             "enable_cooling": bool(sa_params.enable_cooling),
-            "th_people_factor": sa_params.th_people_factor,
-            "th_lights_factor": sa_params.th_lights_factor,
-            "th_occ_rel_factor": sa_params.th_occ_rel_factor,
-            "th_machines_factor": sa_params.th_machines_factor,
-            "record_overrides_global": sa_params.record_overrides_global,
+            "th_people_factor": float(sa_params.th_people_factor),
+            "th_lights_factor": float(sa_params.th_lights_factor),
+            "th_occ_rel_factor": float(sa_params.th_occ_rel_factor),
+            "th_machines_factor": float(sa_params.th_machines_factor),
+            "record_overrides_global": dict(sa_params.record_overrides_global),
             "record_overrides_by_zone": sa_params.record_overrides_by_zone,
         },
+
         "zone_control_used": zone_control,
         "task_meta": task_meta,
-        "mos_file": mos_file_path,
+        "mos_file": str(mos_file_path),
         "start_sim": int(start_sim),
         "end_sim": int(end_sim),
-        "wwr_factor": wwr_factor,
-        "wwr_patched_files": int(wwr_patched_files),
         "timeseries_csv": ts_meta,
+        "model_export_dir": str(out_dir / "model_export"),
     }
 
     with open(out_dir / "overall.json", "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
 
     dym_api.close()
-    dym_api = None
     shutil.rmtree(work_dir, ignore_errors=True)
 
     return out
 
+
 # ───────────────────────────────────────────────────────────────
 # Batch runner
 # ───────────────────────────────────────────────────────────────
-def _worker(task):
+def _worker(task: Dict[str, Any]):
     return simulate_one(**task)
+
 
 def run_many(tasks: List[Dict[str, Any]], n_proc: int = 1):
     if n_proc == 1:
         return [_worker(t) for t in tasks]
+
     ctx = multiprocessing.get_context("spawn")
     with ctx.Pool(processes=n_proc, maxtasksperchild=1) as pool:
         return pool.map(_worker, tasks)
