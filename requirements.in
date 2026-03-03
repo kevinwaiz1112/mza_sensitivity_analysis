@@ -2,3 +2,4 @@ ebcpy
 numpy
 pandas
 matplotlib
+teaser @ git+https://github.com/kevinwaiz1112/TEASER.git@teaser_adaption_for_lpg

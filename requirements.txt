@@ -106,6 +106,7 @@ six==1.17.0
     # via python-dateutil
 tables==3.10.1
     # via ebcpy
+teaser @ git+https://github.com/kevinwaiz1112/TEASER.git@teaser_adaption_for_lpg
 threadpoolctl==3.6.0
     # via scikit-learn
 typing-extensions==4.15.0
