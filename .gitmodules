@@ -1,3 +1,4 @@
 [submodule "external/AixLib"]
 	path = external/AixLib
-	url = https://github.com/RWTH-EBC/AixLib.git
+	url = https://github.com/kevinwaiz1112/AixLib.git
+	branch = branch_rom_lpg
