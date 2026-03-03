@@ -60,8 +60,8 @@ MOS_FILES: Dict[str, str] = {
     "TRY_A": r"C:\path\to\TRY_A.mos",
     "TRY_B": r"C:\path\to\TRY_B.mos",
     # optional:
-    "WeekCold": r"C:\path\to\WeekCold.mos",
-    "WeekHot": r"C:\path\to\WeekHot.mos",
+    # "WeekCold": r"C:\path\to\WeekCold.mos",
+    # "WeekHot": r"C:\path\to\WeekHot.mos",
 }
 
 # Parallelisierung

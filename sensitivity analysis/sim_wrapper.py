@@ -121,6 +121,55 @@ def build_selected_parameters(n_zones: int) -> List[Tuple[str, str]]:
 
     return base
 
+def _scale_array_assignment_in_mo(content: str, key: str, factor: float) -> str:
+    """
+    Skaliert z.B. AWin = {1,2,3} -> AWin = {f*1,f*2,f*3}
+    """
+    pattern = re.compile(rf"(\b{re.escape(key)}\b\s*=\s*)\{{([^}}]+)\}}", re.MULTILINE)
+
+    def repl(m):
+        prefix = m.group(1)
+        inner = m.group(2).strip()
+        parts = [p.strip() for p in inner.split(",") if p.strip()]
+        vals = []
+        for p in parts:
+            # toleriert floats/ints in Modelica-Format
+            try:
+                vals.append(float(p))
+            except Exception:
+                # wenn parsing scheitert, unverändert lassen
+                return m.group(0)
+        scaled = [v * float(factor) for v in vals]
+        inner_scaled = ", ".join(f"{v:.15g}" for v in scaled)
+        return f"{prefix}{{{inner_scaled}}}"
+
+    return pattern.sub(repl, content)
+
+
+def apply_wwr_factor_to_zone_records(sim_models_dir: str, formatted_id: str, wwr_factor: float) -> int:
+    """
+    Skaliert AWin und ATransparent in allen Zone-Records.
+    Rückgabe: Anzahl gepatchter Dateien.
+    """
+    zfiles = find_zone_record_files(sim_models_dir, formatted_id)
+    if not zfiles:
+        return 0
+
+    patched = 0
+    for _znum, fp in zfiles:
+        with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+
+        new_content = content
+        new_content = _scale_array_assignment_in_mo(new_content, "AWin", float(wwr_factor))
+        new_content = _scale_array_assignment_in_mo(new_content, "ATransparent", float(wwr_factor))
+
+        if new_content != content:
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            patched += 1
+
+    return patched
 
 def _tsd_time_vector(tsd: TimeSeriesData) -> np.ndarray:
     """
@@ -524,7 +573,7 @@ def simulate_one(
     zone_control: Optional[dict] = None,
     task_meta: Optional[Dict[str, Any]] = None,
     # rebuild behavior
-    force_teaser_rebuild: bool = False,
+    force_teaser_rebuild: bool = True,
 ):
     json_id = to_dashed_id(building_id)
     formatted_id = json_id.replace("-", "")
@@ -645,8 +694,18 @@ def simulate_one(
         cool_vals_K=cool_vals_K,
     )
 
+    wwr_factor = float(sa_params.record_overrides_global.get("wwr_factor", 1.0))
+    wwr_patched_files = apply_wwr_factor_to_zone_records(sim_models_dir, formatted_id, wwr_factor)
+
     # 2) Record overrides je Zone anwenden
     patched = apply_zone_record_overrides(sim_models_dir, formatted_id, sa_params)
+
+    # nach ensure_teaser_model(...) in simulate_one:
+    model_src = os.path.join(sim_models_dir, formatted_id)
+    model_dst = os.path.join(str(out_dir), "model_export")
+    if os.path.isdir(model_dst):
+        shutil.rmtree(model_dst, ignore_errors=True)
+    shutil.copytree(model_src, model_dst)
 
     # 3) Dymola Run
     teaser_mo = os.path.join(sim_models_dir, "package.mo")
@@ -726,6 +785,8 @@ def simulate_one(
         "mos_file": mos_file_path,
         "start_sim": int(start_sim),
         "end_sim": int(end_sim),
+        "wwr_factor": wwr_factor,
+        "wwr_patched_files": int(wwr_patched_files),
         "timeseries_csv": ts_meta,
     }
 
