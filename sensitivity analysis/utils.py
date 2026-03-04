@@ -85,6 +85,36 @@ def building_model_exists(building_id: str, sim_models_dir: str) -> bool:
     root = Path(sim_models_dir)
     return (root / f"{building_id}.mo").is_file() or (root / building_id / "package.mo").is_file()
 
+def resolve_export_dirs(sim_models_dir: str, formatted_id: str) -> tuple[Path, Path]:
+    """
+    Returns (pkg_root_dir, model_dir)
+    pkg_root_dir: directory containing the package.mo that Dymola loads
+    model_dir: directory containing <formatted_id>.mo and the txt tables
+    """
+    sim_dir = Path(sim_models_dir)
+    fid = formatted_id
+
+    candidates = [
+        sim_dir,                 # package.mo at sim_models_dir/package.mo
+        sim_dir / fid,           # package.mo at sim_models_dir/fid/package.mo
+        sim_dir / fid / fid,     # package.mo at sim_models_dir/fid/fid/package.mo
+    ]
+
+    pkg_root = None
+    for c in candidates:
+        if (c / "package.mo").is_file():
+            pkg_root = c
+            break
+    if pkg_root is None:
+        raise FileNotFoundError("package.mo not found in expected locations")
+
+    # model_dir is usually pkg_root/fid (because package contains a subpackage fid)
+    model_dir = pkg_root / fid
+    if not (model_dir / f"{fid}.mo").is_file():
+        # fallback: sometimes the model is directly in pkg_root
+        model_dir = pkg_root
+
+    return pkg_root, model_dir
 
 # ───────────────────────────────────────────────────────────────
 # Weather: parse .mos and update Modelica file reference
@@ -106,7 +136,8 @@ def parse_weather_and_update_reference(
       df_temperature, outdoor_temperature_data (list of tuples)
     """
     mos_file_path = str(Path(mos_file_path).resolve())
-    model_mo_path = Path(sim_models_dir) / str(formatted_id) / f"{formatted_id}.mo"
+    pkg_root, model_dir = resolve_export_dirs(sim_models_dir, formatted_id)
+    model_mo_path = model_dir / f"{formatted_id}.mo"
 
     # --- parse mos ---
     with open(mos_file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -130,7 +161,7 @@ def parse_weather_and_update_reference(
     df_temperature = pd.DataFrame(outdoor_temperature_data, columns=["time_in_seconds", "temp_celsius"])
     start_date = pd.Timestamp(start_date_str)
     if not df_temperature.empty:
-        df_temperature["datetime"] = (start_date + pd.to_timedelta(df_temperature["time_in_seconds"], unit="s")).dt.round("H")
+        df_temperature["datetime"] = (start_date + pd.to_timedelta(df_temperature["time_in_seconds"], unit="s")).dt.round("h")
         df_temperature = df_temperature[["datetime", "temp_celsius"]].rename(columns={"temp_celsius": "temp"})
     else:
         df_temperature = pd.DataFrame(columns=["datetime", "temp"])

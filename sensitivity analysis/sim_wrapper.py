@@ -9,6 +9,7 @@ import csv
 import multiprocessing
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Tuple
+from pathlib import Path
 
 import numpy as np
 from ebcpy import DymolaAPI, TimeSeriesData
@@ -20,6 +21,7 @@ from utils import (
     parse_weather_and_update_reference,
     to_dashed_id,
     build_lpg_apartments_year,
+    resolve_export_dirs
 )
 
 OUTPUT_INTERVAL_SEC = 60 * 60
@@ -63,24 +65,19 @@ def _read_lines(path: str) -> List[str]:
 
 
 def find_zone_record_files(sim_models_dir: str, formatted_id: str) -> list[tuple[int, str]]:
-    """
-    Returns list [(zone_number_in_filename, filepath), ...] sorted by zone_number_in_filename.
-    Expects files like: <formatted_id>_Storey_1_Zone_2.mo
-    """
-    record_dir = os.path.join(sim_models_dir, formatted_id, f"{formatted_id}_DataBase")
-    if not os.path.isdir(record_dir):
+    record_dir = find_database_dir(sim_models_dir, formatted_id)
+    if record_dir is None:
         return []
 
     patt = re.compile(rf"^{re.escape(formatted_id)}_.*_Zone_(\d+)\.mo$", re.IGNORECASE)
-    out: list[tuple[int, str]] = []
+    out = []
     for fn in os.listdir(record_dir):
         if not fn.lower().endswith(".mo"):
             continue
         m = patt.match(fn)
         if not m:
             continue
-        z = int(m.group(1))
-        out.append((z, os.path.join(record_dir, fn)))
+        out.append((int(m.group(1)), str(record_dir / fn)))
 
     out.sort(key=lambda t: t[0])
     return out
@@ -247,7 +244,7 @@ def apply_record_overrides_regex(record_file_path: str, overrides: Dict[str, Any
 
     for k, v in overrides.items():
         pattern = re.compile(rf"(\b{re.escape(k)}\b\s*=\s*)([^,\)\n]+)")
-        content = pattern.sub(rf"\1{fmt(v)}", content)
+        content = pattern.sub(lambda m, _val=fmt(v): m.group(1) + _val, content)
 
     with open(record_file_path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -570,6 +567,39 @@ def write_timeseries_csv(
     return {"csv_path": out_csv_path, "n_rows": n, "columns": cols, "missing_variables": missing}
 
 
+def patch_init_settings(model_dir: str, main_model: str):
+    root = Path(model_dir)
+
+    # suche alle passenden .mo-Dateien im Exportordner (auch in Unterordnern)
+    candidates = list(root.rglob(f"{main_model}.mo"))
+    if not candidates:
+        raise FileNotFoundError(f"Keine {main_model}.mo unter {root} gefunden")
+
+    for p in candidates:
+        txt = p.read_text(encoding="utf-8", errors="ignore")
+        txt2 = (txt.replace(
+                    "Modelica.Fluid.Types.Dynamics.FixedInitial",
+                    "Modelica.Fluid.Types.Dynamics.SteadyStateInitial"
+                )
+                .replace(
+                    "der_T(fixed=true)",
+                    "der_T(fixed=false)"
+                ))
+        if txt2 != txt:
+            p.write_text(txt2, encoding="utf-8")
+            print("[PATCHED]", p)
+
+def find_database_dir(sim_models_dir: str, formatted_id: str) -> Path | None:
+    root = Path(sim_models_dir)
+    # typischerweise liegt es unter .../<fid>/.../<fid>_DataBase
+    hits = list(root.rglob(f"{formatted_id}_DataBase"))
+    hits = [h for h in hits if h.is_dir()]
+    if not hits:
+        return None
+    # nimm den "tiefsten" (meist der echte Export)
+    hits.sort(key=lambda p: len(p.parts), reverse=True)
+    return hits[0]
+
 # ───────────────────────────────────────────────────────────────
 # Single run
 # ───────────────────────────────────────────────────────────────
@@ -624,12 +654,15 @@ def simulate_one(
         formatted_id=formatted_id,
     )
 
-    combi_time_table_path = os.path.join(sim_models_dir, formatted_id, f"InternalGains_{formatted_id}.txt")
-    time_table_T_set      = os.path.join(sim_models_dir, formatted_id, f"TsetHeat_{formatted_id}.txt")
-    time_table_T_set_cool = os.path.join(sim_models_dir, formatted_id, f"TsetCool_{formatted_id}.txt")
+    pkg_root, model_dir = resolve_export_dirs(sim_models_dir, formatted_id)
+
+    combi_time_table_path = str(model_dir / f"InternalGains_{formatted_id}.txt")
+    time_table_T_set = str(model_dir / f"TsetHeat_{formatted_id}.txt")
+    time_table_T_set_cool = str(model_dir / f"TsetCool_{formatted_id}.txt")
 
     full_year_hours = 8760
-    n_zones = _infer_n_zones_from_any_record(sim_models_dir, formatted_id)
+    zfiles = find_zone_record_files(sim_models_dir, formatted_id)
+    n_zones = max(1, len(zfiles))
 
     # 1) LPG profile generation
     if sa_params.lpg_cfg is None:
@@ -728,8 +761,33 @@ def simulate_one(
     shutil.copytree(model_src, model_dst)
 
     # 5) Dymola simulation
-    teaser_mo = os.path.join(sim_models_dir, "package.mo")
-    model_name = f"{sim_model_pkg_name}.{formatted_id}.{formatted_id}"
+    sim_dir = Path(sim_models_dir)
+    fid = str(formatted_id)
+
+    candidates = [
+        (sim_dir / "package.mo", f"{sim_model_pkg_name}.{fid}.{fid}"),
+        (sim_dir / fid / "package.mo", f"{fid}.{fid}.{fid}"),
+        (sim_dir / fid / fid / "package.mo", f"{fid}.{fid}"),
+    ]
+
+    teaser_mo = None
+    model_name = None
+    for pm, mn in candidates:
+        if pm.is_file():
+            teaser_mo = str(pm)
+            model_name = mn
+            break
+
+    if teaser_mo is None:
+        raise FileNotFoundError(
+            "No package.mo found. Tried:\n"
+            + "\n".join(str(pm) for pm, _ in candidates)
+        )
+
+    print("[DEBUG] teaser_mo:", teaser_mo)
+    print("[DEBUG] model_name:", model_name)
+
+    patch_init_settings(model_dir=sim_models_dir, main_model=formatted_id)
 
     dym_api = DymolaAPI(
         working_directory=str(work_dir),

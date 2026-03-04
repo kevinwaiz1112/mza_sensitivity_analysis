@@ -593,10 +593,7 @@ def create_teaser_project(
         element_areas = dict()
         # Pfad zur JSON-Datei
         # Relativer Pfad zur JSON-Datei
-        json_file_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "..", "data", "geodata", "tabula_area_factors.json"
-        )
+        json_file_path = Path(__file__).resolve().parent.parent / "data" / "geodata" / "tabula_area_factors.json"
         with open(json_file_path, 'r') as json_file:
             json_data = json.load(json_file)
         try:
@@ -677,10 +674,8 @@ def create_teaser_project(
                 if j == 0:
                     # Ground floor area calculation for each zone if zone is in first floor
                     for i, (floor_polygon, floor_data) in enumerate(zone['floors']):
-                        area_ground1 = (
-                                floor_data[0] * area_factors["rt1"] / (area_factors["rt1"] + area_factors["rt2"]))
-                        area_ground2 = (
-                                floor_data[0] * area_factors["rt2"] / (area_factors["rt1"] + area_factors["rt2"]))
+                        area_ground1 = floor_data[0] * area_factors["gf1"] / (area_factors["gf1"] + area_factors["gf2"])
+                        area_ground2 = floor_data[0] * area_factors["gf2"] / (area_factors["gf1"] + area_factors["gf2"])
                         if area_ground1 > 0:
                             ground = GroundFloor(parent=tz)
                             ground.name = f"GroundFloor_{tz.name}_{i + 1}_1"
@@ -768,8 +763,7 @@ def create_teaser_project(
                                 if "win" in open_type:
                                     area = 0  # No window area if there is no open wall
                                 else:
-                                    area = (wall_area * area_factors[open_type] /
-                                            area_factors["ow1"] + area_factors["ow2"])
+                                    area = wall_area * area_factors[open_type] / (area_factors["ow1"] + area_factors["ow2"])
 
                             if area > 0:
                                 if "ow1" in open_type:
@@ -827,7 +821,7 @@ def create_teaser_project(
         # Processing interzonal elements
         k = 0
         for storey_k in building_info['polygons']['storeys']:
-            setpoint_difference_for_exchange = 3
+            setpoint_difference_for_exchange = 1
             for zone in storey_k["zones"]:
                 if _is_core_zone(zone["name"], n_cores) and k != 0:
                     continue
@@ -886,16 +880,20 @@ def create_teaser_project(
                             if type_export == 'outer_ordered' or type_export == 'outer_reversed':
                                 interzonal_wall = InterzonalWall(parent=tz, other_side=zone_objects[other_zone_name])
                                 interzonal_wall.name = f"InterzonalWall_{tz.name}_to_{other_zone_name}"
+
+                                interzonal_wall.interzonal_type_material = type_export
+                                interzonal_wall.interzonal_type_export = type_export
+
                                 iz_constr_1 = f"{construction_type}_1_{tabula_building_type}"
                                 interzonal_wall.load_type_element(
                                     year=building.year_of_construction,
-                                    construction=iz_constr_1
+                                    construction=iz_constr_1,
+                                    data_class=prj.data,
                                 )
+
                                 interzonal_wall.area = wall_area
                                 interzonal_wall.tilt = wall_tilt
                                 interzonal_wall.orientation = wall_orientation
-                                interzonal_wall.interzonal_type_export = type_export
-                                interzonal_wall.interzonal_type_material = type_export
 
                             else:
                                 inner_wall = InnerWall(parent=tz)
@@ -947,17 +945,20 @@ def create_teaser_project(
                                     interzonal_floor = InterzonalFloor(parent=tz,
                                                                        other_side=zone_objects[other_zone_name])
                                     interzonal_floor.name = f"InterzonalFloor_{tz.name}_to_{other_zone_name}"
+
+                                    interzonal_floor.interzonal_type_material = type_export
+                                    interzonal_floor.interzonal_type_export = type_export
+
                                     iz_constr_1 = f"{construction_type}_1_{tabula_building_type}"
                                     interzonal_floor.load_type_element(
                                         year=building.year_of_construction,
-                                        construction=iz_constr_1
+                                        construction=iz_constr_1,
+                                        data_class=prj.data,
                                     )
 
                                     interzonal_floor.area = floor_area
                                     interzonal_floor.tilt = floor_tilt
                                     interzonal_floor.orientation = floor_orientation
-                                    interzonal_floor.interzonal_type_export = type_export
-                                    interzonal_floor.interzonal_type_material = type_export
 
                                 else:
                                     inner_floor = Floor(parent=tz)
@@ -1018,17 +1019,19 @@ def create_teaser_project(
                                     interzonal_ceiling = InterzonalCeiling(parent=tz,
                                                                            other_side=zone_objects[other_zone_name])
                                     interzonal_ceiling.name = f"InterzonalCeiling_{tz.name}_to_{other_zone_name}"
+                                    interzonal_ceiling.interzonal_type_material = type_export
+                                    interzonal_ceiling.interzonal_type_export = type_export
+
                                     iz_constr_1 = f"{construction_type}_1_{tabula_building_type}"
                                     interzonal_ceiling.load_type_element(
                                         year=building.year_of_construction,
-                                        construction=iz_constr_1
+                                        construction=iz_constr_1,
+                                        data_class=prj.data,
                                     )
 
                                     interzonal_ceiling.area = ceiling_area
                                     interzonal_ceiling.tilt = ceiling_tilt
                                     interzonal_ceiling.orientation = ceiling_orientation
-                                    interzonal_ceiling.interzonal_type_export = type_export
-                                    interzonal_ceiling.interzonal_type_material = type_export
 
                                 else:
                                     inner_ceiling = Ceiling(parent=tz)
@@ -1070,6 +1073,38 @@ def create_teaser_project(
         building.roof_type_code = str(building_info['building_data'].get('bldg:roofType', 'default'))
 
         # Perform final calculations for building elements (AixLib library)
+
+        import math
+
+        def _bad(x):
+            return x is None or (isinstance(x, (int, float)) and (math.isnan(x) or math.isinf(x)))
+
+        def validate_teaser(building):
+            bad = []
+            for tz in building.thermal_zones:
+                elems = []
+                for attr in [
+                    "outer_walls", "windows", "rooftops", "ground_floors",
+                    "inner_walls", "floors", "ceilings",
+                    "interzonal_walls", "interzonal_floors", "interzonal_ceilings"
+                ]:
+                    if hasattr(tz, attr):
+                        elems += list(getattr(tz, attr) or [])
+                for e in elems:
+                    ic = getattr(e, "inner_convection", None)
+                    area = getattr(e, "area", None)
+                    # Sammle alle Kandidaten, die TEASER später killen
+                    if ic is None or _bad(area) or area <= 0:
+                        bad.append((tz.name, type(e).__name__, e.name, area, ic))
+            return bad
+
+        bad = validate_teaser(building)
+        if bad:
+            print("BAD ELEMENTS:")
+            for row in bad[:200]:
+                print(row)
+            raise RuntimeError(f"Found {len(bad)} invalid elements (area<=0/NaN or inner_convection None).")
+
         building.calc_building_parameter(number_of_elements=5, used_library="AixLib")
 
         # prj.t_soil_file_path = utilities.get_full_path(

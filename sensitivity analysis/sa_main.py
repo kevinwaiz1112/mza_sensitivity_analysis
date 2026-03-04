@@ -90,7 +90,7 @@ END_SIM = 365 * 24 * 3600
 N_PROC = 1
 
 # Dry-run
-DRY_RUN = True            # True = build+validate inputs + preview json; no simulation
+DRY_RUN = False            # True = build+validate inputs + preview json; no simulation
 DRY_RUN_PREVIEW_N = 10    # preview N tasks
 DRY_RUN_BUILD_SAMPLE = True  # also write per-task small preview JSON for first N
 
