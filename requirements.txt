@@ -3,7 +3,7 @@
 # by the following command:
 #
 #    pip-compile --output-file=requirements.txt requirements.in
-#
+#    pip install -r .\requirements.txt
 annotated-types==0.7.0
     # via pydantic
 attrs==25.4.0
@@ -102,6 +102,7 @@ scipy==1.15.3
     # via
     #   ebcpy
     #   scikit-learn
+shapely==2.1.2
 six==1.17.0
     # via python-dateutil
 tables==3.10.1
