@@ -329,12 +329,14 @@ def create_teaser_project(
         use_conds = "DINV18599_Living_SFH"
 
     # Retrofit-State ggf. aus building_data
-    ret_state = str(bd.get('bldg:retrofit_state', 'standard')).strip()
+    ret_state = str(
+        bd.get("sa_retrofit_state", bd.get("bldg:retrofit_state", "standard"))
+    ).strip()
     if not ret_state:
-        ret_state = 'standard'
-    construction_type = f'tabula_{ret_state}'
+        ret_state = "standard"
+    construction_type = f"tabula_{ret_state}"
     if construction is not None:
-        construction_type = f'tabula_{construction}'
+        construction_type = f"tabula_{construction}"
 
     setpoint_difference_for_exchange = 3
     # Check if the building has only one zone (single-zone building)

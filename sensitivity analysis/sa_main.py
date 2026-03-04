@@ -9,11 +9,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-# NOTE:
-# - keep import name consistent with your runner file
-#   If your runner module is called sa_sim_runner.py, change to:
-#       from sa_sim_runner import SAParams, run_many
 from sim_wrapper import SAParams, run_many
 
 from utils import LPGSelectionConfig
@@ -75,12 +70,16 @@ SIM_MODEL_PKG_PREFIX = "sensitivity_analysis"
 # Weather files inside repo (adjust filenames)
 WEATHER_DIR = (DATA_DIR / "weather").resolve()
 MOS_FILES: Dict[str, str] = {
-    "TRY_A": str((WEATHER_DIR / "TRY_A.mos").resolve()),
-    "TRY_B": str((WEATHER_DIR / "TRY_B.mos").resolve()),
+    "TRY_A": str((WEATHER_DIR / "DEU_B_Berlin_2021.mos").resolve()),
+    "TRY_B": str((WEATHER_DIR / "Moabit_2045.mos").resolve()),
     # optional:
     # "WeekCold": str((WEATHER_DIR / "WeekCold.mos").resolve()),
     # "WeekHot":  str((WEATHER_DIR / "WeekHot.mos").resolve()),
 }
+
+RETROFIT_PROB_STANDARD = 0.80  # X = 80% standard, 20% retrofit
+RETROFIT_LABEL_STANDARD = "standard"
+RETROFIT_LABEL_RETROFIT = "retrofit"
 
 # Simulation window
 YEAR = 2021
@@ -150,6 +149,9 @@ def _preview_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "n_zone_control_zones": len(zones),
         "zone_names_first5": zones[:5],
         "sa_params": _jsonable_sa_params(task["sa_params"]) if "sa_params" in task else None,
+        "sa_retrofit_state": bd.get("sa_retrofit_state"),
+        "sa_retrofit_is_standard": bd.get("sa_retrofit_is_standard"),
+        "sa_retrofit_p_standard": bd.get("sa_retrofit_p_standard"),
     }
 
 
@@ -364,6 +366,9 @@ def apply_yoc_and_setpoints_to_payload(
     spread_K_max: float = 2.0,
     per_zone_clip_K: float = 4.0,
     core_setpoint_C: float = 8.0,
+    retrofit_p_standard: float = 0.80,
+    retrofit_standard_label: str = "standard",
+    retrofit_retrofit_label: str = "retrofit",
 ) -> Dict[str, Any]:
     """
     Adds SA fields into a copy of the payload:
@@ -391,6 +396,14 @@ def apply_yoc_and_setpoints_to_payload(
     bd["sa_yoc_is_correct"] = bool(is_correct)
     bd["sa_yoc_base_class"] = int(base_class)
     bd["sa_yoc_error_step"] = int(yoc_error)
+
+    # ── Retrofit state: standard vs retrofit
+    is_standard = bool(rng.random() < float(retrofit_p_standard))
+    retrofit_state = retrofit_standard_label if is_standard else retrofit_retrofit_label
+
+    bd["sa_retrofit_state"] = str(retrofit_state)
+    bd["sa_retrofit_is_standard"] = bool(is_standard)
+    bd["sa_retrofit_p_standard"] = float(retrofit_p_standard)
 
     # Setpoints: mean + spread, heterogenous per zone
     sigma_mean = float(rng.uniform(sigma_mean_K_min, sigma_mean_K_max))
@@ -479,7 +492,8 @@ def build_tasks(
         if vkey not in VARIANTS:
             raise KeyError(f"Unknown variant: {vkey}")
         v = VARIANTS[vkey]
-        sim_models_dir = sim_models_dir_for_variant(v)
+
+        base_sim_models_dir = Path(sim_models_dir_for_variant(v))  # Var_X
         sim_pkg = sim_model_pkg_name_for_variant(v)
 
         for bid, base_payload in building_payloads_by_id.items():
@@ -492,6 +506,7 @@ def build_tasks(
                     base_payload=base_payload,
                     rng=rng_bs,
                     yoc_accuracy=0.83,
+                    retrofit_p_standard=RETROFIT_PROB_STANDARD,
                 )
 
                 zone_control = enriched_payload.get("building_data", {}).get("sa_zone_control", None)
@@ -502,6 +517,15 @@ def build_tasks(
                 mos_path = MOS_FILES[wkey]
 
                 for seed in seeds:
+                    sim_models_dir_task = (
+                        base_sim_models_dir
+                        / "_runs"
+                        / str(bid)
+                        / wkey
+                        / f"sample_{int(s['sample_id']):04d}"
+                        / f"seed_{int(seed)}"
+                    )
+
                     sa_params = SAParams(
                         gains_scale=float(s["gains_scale"]),
                         zone_weights=None,
@@ -541,11 +565,14 @@ def build_tasks(
                         "sa_tabula_year_class": enriched_payload.get("building_data", {}).get("sa_tabula_year_class"),
                         "sa_tset_mean_K": enriched_payload.get("building_data", {}).get("sa_tset_mean_K"),
                         "sa_tset_spread_K": enriched_payload.get("building_data", {}).get("sa_tset_spread_K"),
+                        "sa_retrofit_state": enriched_payload.get("building_data", {}).get("sa_retrofit_state"),
+                        "sa_retrofit_is_standard": enriched_payload.get("building_data", {}).get(
+                            "sa_retrofit_is_standard"),
                     }
 
                     tasks.append({
                         "out_dir": str(out_dir),
-                        "sim_models_dir": str(sim_models_dir),
+                        "sim_models_dir": str(sim_models_dir_task),
                         "sim_model_pkg_name": sim_pkg,
                         "aixlib_mo": str(AIXLIB_MO),
                         "building_id": str(bid),
@@ -623,7 +650,9 @@ if __name__ == "__main__":
         }, f, indent=2, ensure_ascii=False)
 
     print(f"[DEBUG] DRY_RUN={DRY_RUN} (type={type(DRY_RUN)})")
+
     if DRY_RUN:
         dry_run_validate_and_save(tasks, out_base=OUT_BASE, preview_n=DRY_RUN_PREVIEW_N)
     else:
-        raise RuntimeError("DRY_RUN=False: simulation is intentionally disabled in this script.")
+        results = run_many(tasks, n_proc=int(N_PROC))
+        print("Finished runs:", len(results))
