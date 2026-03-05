@@ -9,8 +9,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sim_wrapper import SAParams, run_many
 
+from sim_wrapper import SAParams, run_many
 from utils import LPGSelectionConfig
 
 
@@ -18,11 +18,13 @@ from utils import LPGSelectionConfig
 # Repo-relative paths (Windows + Linux)
 # ───────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent  # assumes: <repo>/<something>/sa_head.py (here: ".../sensitivity analysis/sa_head.py")
+REPO_ROOT = SCRIPT_DIR.parent  # assumes: <repo>/<something>/sa_main.py
 
 
 # ───────────────────────────────────────────────────────────────
-# 1) Variants
+# TODO (SA INPUT): Variants / model variants
+# - VARIANTS defines: which TEASER variant to run and how many LPG apartments to sample per variant
+# - Extend: add a new variant (e.g. V9...) + expected_n_zones (documentation / optional sanity check)
 # ───────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class VariantSpec:
@@ -47,27 +49,17 @@ VARIANTS: Dict[str, VariantSpec] = {
 # ───────────────────────────────────────────────────────────────
 # 2) Paths / Inputs (RELATIVE)
 # ───────────────────────────────────────────────────────────────
-
-# AixLib submodule inside repo
 AIXLIB_MO = (REPO_ROOT / "external" / "AixLib" / "AixLib" / "package.mo").resolve()
-
-# Data dir inside repo (adjust to your repo layout)
 DATA_DIR = (REPO_ROOT / "data").resolve()
 
-# Building data inside repo (adjust if needed)
 BUILDING_DATA_CSV = (DATA_DIR / "building_data" / "building_data.csv").resolve()
 BUILDING_DATA_PKL = (DATA_DIR / "building_data" / "building_data.pkl").resolve()
 
-# TEASER export base directory (models live here)
 TEASER_BASE = (REPO_ROOT / "teaser_models" / "sensitivity_analysis").resolve()
-
-# Results output
 OUT_BASE = (REPO_ROOT / "results" / "sa_results").resolve()
 
-# Modelica package namespace prefix (unchanged)
 SIM_MODEL_PKG_PREFIX = "sensitivity_analysis"
 
-# Weather files inside repo (adjust filenames)
 WEATHER_DIR = (DATA_DIR / "weather").resolve()
 MOS_FILES: Dict[str, str] = {
     "TRY_A": str((WEATHER_DIR / "DEU_B_Berlin_2021.mos").resolve()),
@@ -77,29 +69,58 @@ MOS_FILES: Dict[str, str] = {
     # "WeekHot":  str((WEATHER_DIR / "WeekHot.mos").resolve()),
 }
 
-RETROFIT_PROB_STANDARD = 0.80  # X = 80% standard, 20% retrofit
+
+# ───────────────────────────────────────────────────────────────
+# TODO (SA INPUT): Retrofit handling
+# - RETROFIT_PROB_STANDARD: probability for "standard" (else "retrofit")
+# - Labels are arbitrary, but should remain consistent in the payload for downstream analysis
+# - Extend: replace Bernoulli by multi-class sampling / explicit scenario selection
+# ───────────────────────────────────────────────────────────────
+RETROFIT_PROB_STANDARD = 0.80
 RETROFIT_LABEL_STANDARD = "standard"
 RETROFIT_LABEL_RETROFIT = "retrofit"
 
-# Simulation window
+
+# ───────────────────────────────────────────────────────────────
+# TODO (SA INPUT): Simulation window
+# - YEAR is used only for metadata (the .mos file effectively defines the weather year)
+# - START_SIM/END_SIM are in seconds
+# ───────────────────────────────────────────────────────────────
 YEAR = 2021
 START_SIM = 0
 END_SIM = 365 * 24 * 3600
 
-# Parallelization
-N_PROC = 1
 
-# Dry-run
-DRY_RUN = False            # True = build+validate inputs + preview json; no simulation
-DRY_RUN_PREVIEW_N = 10    # preview N tasks
-DRY_RUN_BUILD_SAMPLE = True  # also write per-task small preview JSON for first N
+# ───────────────────────────────────────────────────────────────
+# TODO (SA INPUT): Parallelization / runner behavior
+# - N_PROC: number of processes
+# - CONTINUE_ON_ERROR: if True, failing runs are skipped and logged
+# ───────────────────────────────────────────────────────────────
+N_PROC = 1
+CONTINUE_ON_ERROR = True
+
+
+# ───────────────────────────────────────────────────────────────
+# TODO (SA INPUT): Dry-run (task build + validation only)
+# ───────────────────────────────────────────────────────────────
+DRY_RUN = False
+DRY_RUN_PREVIEW_N = 10
+DRY_RUN_BUILD_SAMPLE = True
+
+
+# ───────────────────────────────────────────────────────────────
+# Failure tracking outputs
+# - failed_tasks.pkl: contains full task dicts (incl. SAParams) for reruns
+# - failed_tasks.jsonl: human-readable compact reports (one JSON per line)
+# ───────────────────────────────────────────────────────────────
+FAILED_TASKS_PKL = OUT_BASE / "failed_tasks.pkl"
+FAILED_TASKS_JSONL = OUT_BASE / "failed_tasks.jsonl"
 
 
 # ───────────────────────────────────────────────────────────────
 # Dry-run helpers
 # ───────────────────────────────────────────────────────────────
 def _jsonable_sa_params(p: SAParams) -> Dict[str, Any]:
-    """SAParams is a dataclass; nested LPGSelectionConfig as well."""
     d = {
         "gains_scale": float(p.gains_scale),
         "zone_weights": p.zone_weights,
@@ -127,7 +148,6 @@ def _jsonable_sa_params(p: SAParams) -> Dict[str, Any]:
 
 
 def _preview_task(task: Dict[str, Any]) -> Dict[str, Any]:
-    """Compact preview (avoid huge payload dumps)."""
     bd = (task.get("building_payload", {}) or {}).get("building_data", {}) or {}
     zone_control = bd.get("sa_zone_control", task.get("zone_control"))
     zones = list((zone_control or {}).get("zones", {}).keys()) if isinstance(zone_control, dict) else []
@@ -156,17 +176,12 @@ def _preview_task(task: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def dry_run_validate_and_save(tasks: List[Dict[str, Any]], out_base: Path, preview_n: int = 10) -> None:
-    """
-    Validates that tasks are consistent and writes preview files.
-    No simulation, no runner call.
-    """
     out_base = Path(out_base)
     out_base.mkdir(parents=True, exist_ok=True)
 
     previews: List[Dict[str, Any]] = []
 
     for i, t in enumerate(tasks):
-        # Required keys for the runner
         required = [
             "out_dir", "sim_models_dir", "sim_model_pkg_name", "aixlib_mo",
             "building_id", "mos_file_path", "year", "start_sim", "end_sim",
@@ -176,7 +191,6 @@ def dry_run_validate_and_save(tasks: List[Dict[str, Any]], out_base: Path, previ
             if k not in t:
                 raise KeyError(f"Task {i} missing key '{k}'")
 
-        # LPG config checks
         cfg = t["sa_params"].lpg_cfg
         if cfg is None:
             raise ValueError(f"Task {i}: sa_params.lpg_cfg is None")
@@ -187,10 +201,6 @@ def dry_run_validate_and_save(tasks: List[Dict[str, Any]], out_base: Path, previ
         ssum = float(sum(cfg.size_probs.values()))
         if not (0.999 <= ssum <= 1.001):
             raise ValueError(f"Task {i}: size_probs sum={ssum} (expected ~1)")
-
-        # Weather file extension sanity (path may still be placeholder)
-        if Path(str(t["mos_file_path"])).suffix.lower() != ".mos":
-            pass
 
         if i < preview_n:
             previews.append(_preview_task(t))
@@ -203,7 +213,8 @@ def dry_run_validate_and_save(tasks: List[Dict[str, Any]], out_base: Path, previ
 
     preview_path = out_base / "dryrun_preview.json"
     with open(preview_path, "w", encoding="utf-8") as f:
-        json.dump({"n_tasks": len(tasks), "preview_n": len(previews), "preview": previews}, f, indent=2, ensure_ascii=False)
+        json.dump({"n_tasks": len(tasks), "preview_n": len(previews), "preview": previews}, f, indent=2,
+                  ensure_ascii=False)
 
     print(f"[DRY_RUN] Built {len(tasks)} tasks. Preview saved to: {preview_path}")
     if previews:
@@ -212,19 +223,17 @@ def dry_run_validate_and_save(tasks: List[Dict[str, Any]], out_base: Path, previ
 
 
 # ───────────────────────────────────────────────────────────────
-# 3) LPG Config Builder
+# TODO (SA INPUT): LPG handling
+# - HOUSEHOLD_TEMPLATES / HOUSEHOLD_SIZE_PROBS: controls household-size distribution
+# - make_lpg_cfg: TP region (tp_key), seed mode (random_r / mean_r), r_values
+# - Extend: add lights/people/machines scaling as an extra sampled dimension
 # ───────────────────────────────────────────────────────────────
 HOUSEHOLD_TEMPLATES = [
-    # 1 person
     ("CHR07", 1), ("CHR09", 1), ("CHR10", 1), ("CHR13", 1),
     ("CHR23", 1), ("CHR24", 1), ("CHR30", 1), ("OR01", 1),
-    # 2 persons
     ("CHR01", 2), ("CHR02", 2), ("CHR16", 2), ("CHR17", 2),
-    # 3 persons
     ("CHR03", 3), ("CHR52", 3),
-    # 4 persons
     ("CHR27", 4),
-    # 5 persons
     ("CHR41", 5),
 ]
 
@@ -245,16 +254,9 @@ def make_lpg_cfg(n_apartments: int, tp_key: str = "TP_BER21", seed_mode: str = "
 
 
 # ───────────────────────────────────────────────────────────────
-# 4) Building-Data Loader
+# Building data loader
 # ───────────────────────────────────────────────────────────────
 def load_building_data(pkl_path: Path, csv_path: Path) -> List[Dict[str, Any]]:
-    """
-    Prefer PKL. CSV fallback.
-    Returns list of dicts with keys:
-      - building_id
-      - payload (if PKL)
-      - rows (if CSV fallback)
-    """
     pkl_path = Path(pkl_path)
     csv_path = Path(csv_path)
 
@@ -290,7 +292,6 @@ def load_building_data(pkl_path: Path, csv_path: Path) -> List[Dict[str, Any]]:
 
 
 def index_payloads_by_id(building_data: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Map building_id -> payload dict (PKL case only)."""
     out: Dict[str, Dict[str, Any]] = {}
     for b in building_data:
         bid = str(b.get("building_id", "")).strip()
@@ -301,10 +302,9 @@ def index_payloads_by_id(building_data: List[Dict[str, Any]]) -> Dict[str, Dict[
 
 
 # ───────────────────────────────────────────────────────────────
-# 5) Variant -> TEASER Export paths
+# Variant -> TEASER export paths
 # ───────────────────────────────────────────────────────────────
 def sim_models_dir_for_variant(v: VariantSpec) -> str:
-    # return string for runner compatibility (utils likely uses os.path)
     return str((TEASER_BASE / f"Var_{v.idx}").resolve())
 
 
@@ -313,7 +313,11 @@ def sim_model_pkg_name_for_variant(v: VariantSpec) -> str:
 
 
 # ───────────────────────────────────────────────────────────────
-# 6) Sampling: YoC + Setpoints + WWR + Weather + GainsScale
+# TODO (SA INPUT): YoC accuracy + setpoint spread + (optional) cooling
+# - yoc_accuracy: probability that TABULA year class is correct
+# - sigma_mean_*: variability of building-wide setpoint mean
+# - spread_*: per-zone variability within a building
+# - core_setpoint_C: "core zone" setpoint (here: treated as unheated; frost-protection logic elsewhere)
 # ───────────────────────────────────────────────────────────────
 def _get_tabula_year_class(payload: Dict[str, Any], fallback: int = 6) -> int:
     bd = payload.get("building_data", {}) if isinstance(payload.get("building_data"), dict) else {}
@@ -355,10 +359,11 @@ def _is_core_zone(zname: str, n_cores: int) -> bool:
 def apply_yoc_and_setpoints_to_payload(
     base_payload: Dict[str, Any],
     rng: np.random.Generator,
+    # ── TODO (SA INPUT): YoC
     yoc_accuracy: float = 0.83,
     yoc_min_class: int = 1,
     yoc_max_class: int = 12,
-    # Setpoints
+    # ── TODO (SA INPUT): Setpoints
     t0_C: float = 20.0,
     sigma_mean_K_min: float = 1.0,
     sigma_mean_K_max: float = 2.0,
@@ -366,15 +371,11 @@ def apply_yoc_and_setpoints_to_payload(
     spread_K_max: float = 2.0,
     per_zone_clip_K: float = 4.0,
     core_setpoint_C: float = 8.0,
+    # ── TODO (SA INPUT): Retrofit
     retrofit_p_standard: float = 0.80,
     retrofit_standard_label: str = "standard",
     retrofit_retrofit_label: str = "retrofit",
 ) -> Dict[str, Any]:
-    """
-    Adds SA fields into a copy of the payload:
-      - building_data["sa_tabula_year_class"]
-      - building_data["sa_zone_control"] (per-zone heating/cooling setpoints)
-    """
     payload = copy.deepcopy(base_payload)
     bd = payload.setdefault("building_data", {})
     if not isinstance(bd, dict):
@@ -397,7 +398,7 @@ def apply_yoc_and_setpoints_to_payload(
     bd["sa_yoc_base_class"] = int(base_class)
     bd["sa_yoc_error_step"] = int(yoc_error)
 
-    # ── Retrofit state: standard vs retrofit
+    # Retrofit state
     is_standard = bool(rng.random() < float(retrofit_p_standard))
     retrofit_state = retrofit_standard_label if is_standard else retrofit_retrofit_label
 
@@ -405,7 +406,7 @@ def apply_yoc_and_setpoints_to_payload(
     bd["sa_retrofit_is_standard"] = bool(is_standard)
     bd["sa_retrofit_p_standard"] = float(retrofit_p_standard)
 
-    # Setpoints: mean + spread, heterogenous per zone
+    # Setpoints: mean + spread
     sigma_mean = float(rng.uniform(sigma_mean_K_min, sigma_mean_K_max))
     t_mean_C = float(rng.normal(loc=t0_C, scale=sigma_mean))
     t_mean_K = t_mean_C + 273.15
@@ -449,6 +450,13 @@ def apply_yoc_and_setpoints_to_payload(
     return payload
 
 
+# ───────────────────────────────────────────────────────────────
+# TODO (SA INPUT): Sample space / sampling
+# - wwr_min/max: window-area factor (record patch of AWin/ATransparent)
+# - gains_min/max: scales internal gains / machines (applied in sim_wrapper via gains_scale)
+# - weather_options: list of MOS_FILES keys
+# - Extend: add more dimensions (e.g., infiltration, U-values, HVAC sizing, ...)
+# ───────────────────────────────────────────────────────────────
 def make_samples(
     N: int,
     rng_seed: int,
@@ -485,6 +493,8 @@ def build_tasks(
     building_payloads_by_id: Dict[str, Dict[str, Any]],
     samples: List[Dict[str, Any]],
     seeds: List[int],
+    # ── TODO (SA INPUT): global defaults/overrides for SAParams (e.g., TH shares)
+    enable_cooling_default: bool = False,
 ) -> List[Dict[str, Any]]:
     tasks: List[Dict[str, Any]] = []
 
@@ -493,7 +503,7 @@ def build_tasks(
             raise KeyError(f"Unknown variant: {vkey}")
         v = VARIANTS[vkey]
 
-        base_sim_models_dir = Path(sim_models_dir_for_variant(v))  # Var_X
+        base_sim_models_dir = Path(sim_models_dir_for_variant(v))
         sim_pkg = sim_model_pkg_name_for_variant(v)
 
         for bid, base_payload in building_payloads_by_id.items():
@@ -502,11 +512,14 @@ def build_tasks(
                 mix_seed = (hash(str(bid)) & 0xFFFFFFFF) ^ (int(s["sample_id"]) * 2654435761)
                 rng_bs = np.random.default_rng(int(mix_seed))
 
+                # ── TODO (SA INPUT): YoC/Retrofit/Setpoint settings per sample
                 enriched_payload = apply_yoc_and_setpoints_to_payload(
                     base_payload=base_payload,
                     rng=rng_bs,
                     yoc_accuracy=0.83,
                     retrofit_p_standard=RETROFIT_PROB_STANDARD,
+                    retrofit_standard_label=RETROFIT_LABEL_STANDARD,
+                    retrofit_retrofit_label=RETROFIT_LABEL_RETROFIT,
                 )
 
                 zone_control = enriched_payload.get("building_data", {}).get("sa_zone_control", None)
@@ -526,6 +539,11 @@ def build_tasks(
                         / f"seed_{int(seed)}"
                     )
 
+                    # ── TODO (SA INPUT): SAParams ("simulation-side knobs")
+                    # - gains_scale: scales machines / internal gains
+                    # - lpg_cfg: controls LPG sampling (templates/TP/seeds)
+                    # - th_*: thermal-hull vs residential split (if applicable)
+                    # - record_overrides_global: e.g. wwr_factor, or additional Modelica record keys
                     sa_params = SAParams(
                         gains_scale=float(s["gains_scale"]),
                         zone_weights=None,
@@ -535,7 +553,7 @@ def build_tasks(
                             tp_key="TP_BER21",
                             seed_mode="random_r",
                         ),
-                        enable_cooling=False,
+                        enable_cooling=bool(enable_cooling_default),
                         th_zone_index=0,
                         th_people_factor=0.1,
                         th_lights_factor=0.1,
@@ -567,7 +585,8 @@ def build_tasks(
                         "sa_tset_spread_K": enriched_payload.get("building_data", {}).get("sa_tset_spread_K"),
                         "sa_retrofit_state": enriched_payload.get("building_data", {}).get("sa_retrofit_state"),
                         "sa_retrofit_is_standard": enriched_payload.get("building_data", {}).get(
-                            "sa_retrofit_is_standard"),
+                            "sa_retrofit_is_standard"
+                        ),
                     }
 
                     tasks.append({
@@ -592,10 +611,35 @@ def build_tasks(
 
 
 # ───────────────────────────────────────────────────────────────
+# Failure tracking helpers
+# ───────────────────────────────────────────────────────────────
+def _append_failed_tasks_pickle(pkl_path: Path, failed_tasks: List[Dict[str, Any]]) -> None:
+    pkl_path = Path(pkl_path)
+    pkl_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: List[Dict[str, Any]] = []
+    if pkl_path.is_file():
+        with open(pkl_path, "rb") as f:
+            existing = pickle.load(f) or []
+
+    existing.extend(failed_tasks)
+    with open(pkl_path, "wb") as f:
+        pickle.dump(existing, f)
+
+
+def _append_failed_tasks_jsonl(jsonl_path: Path, failure_reports: List[Dict[str, Any]]) -> None:
+    jsonl_path = Path(jsonl_path)
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(jsonl_path, "a", encoding="utf-8") as f:
+        for r in failure_reports:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+# ───────────────────────────────────────────────────────────────
 # 8) Main
 # ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # basic path checks (optional but helpful)
     if not AIXLIB_MO.is_file():
         raise FileNotFoundError(f"AIXLIB_MO not found: {AIXLIB_MO}")
     if not (BUILDING_DATA_PKL.is_file() or BUILDING_DATA_CSV.is_file()):
@@ -603,15 +647,14 @@ if __name__ == "__main__":
 
     building_data = load_building_data(BUILDING_DATA_PKL, BUILDING_DATA_CSV)
     payloads_by_id = index_payloads_by_id(building_data)
-
     if not payloads_by_id:
-        raise ValueError(
-            "No payloads found from PKL. For Step 2 (TEASER build) the PKL format (list of payload dicts) is required."
-        )
+        raise ValueError("No payloads found from PKL. PKL payload list is required.")
 
+    # ── TODO (SA INPUT): Variants / weather / experiment scope
     variant_keys = ["V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8"]
-    weather_options = ["TRY_A", "TRY_B"]  # add "WeekCold", "WeekHot" if you enable them in MOS_FILES
+    weather_options = ["TRY_A", "TRY_B"]
 
+    # ── TODO (SA INPUT): Sample size
     N_samples = 70
     S_seeds = 5
 
@@ -623,6 +666,7 @@ if __name__ == "__main__":
         building_payloads_by_id=payloads_by_id,
         samples=samples,
         seeds=seeds,
+        enable_cooling_default=False,
     )
 
     OUT_BASE.mkdir(parents=True, exist_ok=True)
@@ -638,6 +682,7 @@ if __name__ == "__main__":
             "n_buildings": int(len(payloads_by_id)),
             "n_tasks": int(len(tasks)),
             "dry_run": bool(DRY_RUN),
+            "continue_on_error": bool(CONTINUE_ON_ERROR),
             "paths": {
                 "AIXLIB_MO": str(AIXLIB_MO),
                 "BUILDING_DATA_CSV": str(BUILDING_DATA_CSV),
@@ -654,5 +699,32 @@ if __name__ == "__main__":
     if DRY_RUN:
         dry_run_validate_and_save(tasks, out_base=OUT_BASE, preview_n=DRY_RUN_PREVIEW_N)
     else:
-        results = run_many(tasks, n_proc=int(N_PROC))
+        # run_many returns: {"results":[...], "failures":[...]} when continue_on_error=True
+        run_out = run_many(tasks, n_proc=int(N_PROC), continue_on_error=bool(CONTINUE_ON_ERROR))
+        results = run_out.get("results", [])
+        failures = run_out.get("failures", [])
+
+        # persist failures for reruns
+        if failures:
+            failed_tasks = [f["task"] for f in failures if isinstance(f.get("task"), dict)]
+            failure_reports = []
+            for f in failures:
+                tm = (f.get("task", {}) or {}).get("task_meta", {}) or {}
+                failure_reports.append({
+                    "out_dir": (f.get("task", {}) or {}).get("out_dir"),
+                    "building_id": (f.get("task", {}) or {}).get("building_id"),
+                    "variant": tm.get("variant"),
+                    "weather_key": tm.get("weather_key"),
+                    "sample_id": ((tm.get("sample") or {}) or {}).get("sample_id"),
+                    "seed": tm.get("seed"),
+                    "error": f.get("error"),
+                })
+
+            _append_failed_tasks_pickle(FAILED_TASKS_PKL, failed_tasks)
+            _append_failed_tasks_jsonl(FAILED_TASKS_JSONL, failure_reports)
+
+            print(f"[WARN] Failed runs: {len(failures)}")
+            print(f"[WARN] Saved failed tasks to: {FAILED_TASKS_PKL}")
+            print(f"[WARN] Saved failure report to: {FAILED_TASKS_JSONL}")
+
         print("Finished runs:", len(results))

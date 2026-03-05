@@ -10,6 +10,7 @@ import multiprocessing
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
+import traceback
 
 import numpy as np
 from ebcpy import DymolaAPI, TimeSeriesData
@@ -888,10 +889,64 @@ def _worker(task: Dict[str, Any]):
     return simulate_one(**task)
 
 
-def run_many(tasks: List[Dict[str, Any]], n_proc: int = 1):
+def _worker_safe(task: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Wrapper, damit Exceptions pro Task abgefangen und zurückgegeben werden.
+    Rückgabeformat:
+      {"ok": True,  "result": <simulate_one output>}
+      {"ok": False, "error": "...", "traceback": "...", "task": <original task>}
+    """
+    try:
+        res = simulate_one(**task)
+        return {"ok": True, "result": res}
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc(),
+            "task": task,
+        }
+
+
+def run_many(tasks: List[Dict[str, Any]], n_proc: int = 1, continue_on_error: bool = True) -> Dict[str, Any]:
+    """
+    Safe runner:
+      - continue_on_error=True: sammelt failures, bricht nicht ab
+      - continue_on_error=False: verhält sich wie "früher" (Exception stoppt)
+    Returns:
+      {"results": [...], "failures": [...]}
+    """
+    if not continue_on_error:
+        # altes Verhalten (hart abbrechen)
+        if n_proc == 1:
+            return {"results": [simulate_one(**t) for t in tasks], "failures": []}
+
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(processes=n_proc, maxtasksperchild=1) as pool:
+            # pool.map würde hier Exceptions raisen -> bewusst so
+            results = pool.map(lambda t: simulate_one(**t), tasks)
+        return {"results": results, "failures": []}
+
+    # ── continue_on_error=True
+    results: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+
     if n_proc == 1:
-        return [_worker(t) for t in tasks]
+        for t in tasks:
+            out = _worker_safe(t)
+            if out["ok"]:
+                results.append(out["result"])
+            else:
+                failures.append({"task": out["task"], "error": out["error"], "traceback": out["traceback"]})
+        return {"results": results, "failures": failures}
 
     ctx = multiprocessing.get_context("spawn")
     with ctx.Pool(processes=n_proc, maxtasksperchild=1) as pool:
-        return pool.map(_worker, tasks)
+        # imap_unordered: streamt Ergebnisse, stoppt nicht beim ersten Fehler
+        for out in pool.imap_unordered(_worker_safe, tasks, chunksize=1):
+            if out.get("ok"):
+                results.append(out["result"])
+            else:
+                failures.append({"task": out.get("task"), "error": out.get("error"), "traceback": out.get("traceback")})
+
+    return {"results": results, "failures": failures}
